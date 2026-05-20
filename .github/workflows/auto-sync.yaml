@@ -1,0 +1,299 @@
+name: Auto Sync Images
+
+# 自动化策略：定时同步镜像到阿里云
+# - 每天 UTC 时间 02:00 自动执行（北京时间 10:00）
+# - 支持手动触发
+# - 同步前检查镜像是否有更新
+# - 失败时通过 GitHub Issues 自动通知
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      force_sync:
+        description: '强制同步所有镜像（跳过更新检查）'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+env:
+  ALIYUN_REGISTRY: "${{ secrets.ALIYUN_REGISTRY }}"
+  ALIYUN_NAME_SPACE: "${{ secrets.ALIYUN_NAME_SPACE }}"
+  ALIYUN_REGISTRY_USER: "${{ secrets.ALIYUN_REGISTRY_USER }}"
+  ALIYUN_REGISTRY_PASSWORD: "${{ secrets.ALIYUN_REGISTRY_PASSWORD }}"
+
+jobs:
+  check-and-sync:
+    name: Check & Sync Images
+    runs-on: ubuntu-latest
+    outputs:
+      sync_result: ${{ steps.sync.outputs.result }}
+      synced_count: ${{ steps.sync.outputs.synced_count }}
+      skipped_count: ${{ steps.sync.outputs.skipped_count }}
+      failed_count: ${{ steps.sync.outputs.failed_count }}
+    steps:
+      - name: Before freeing up disk space
+        run: |
+          echo "Before freeing up disk space"
+          echo "=============================================================================="
+          df -hT
+          echo "=============================================================================="
+
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 2048
+          swap-size-mb: 128
+          remove-dotnet: 'true'
+          remove-haskell: 'true'
+          build-mount-path: '/var/lib/docker/'
+
+      - name: Restart docker
+        run: sudo service docker restart
+
+      - name: Free up disk space complete
+        run: |
+          echo "Free up disk space complete"
+          echo "=============================================================================="
+          df -hT
+          echo "=============================================================================="
+
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Docker Setup Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Check and Sync Images
+        id: sync
+        run: |
+          docker login -u $ALIYUN_REGISTRY_USER -p $ALIYUN_REGISTRY_PASSWORD $ALIYUN_REGISTRY
+
+          FORCE_SYNC="${{ github.event.inputs.force_sync }}"
+          SYNCED=0
+          SKIPPED=0
+          FAILED=0
+          SYNC_LOG=""
+
+          # 数据预处理,判断镜像是否重名
+          declare -A duplicate_images
+          declare -A temp_map
+          while IFS= read -r line || [ -n "$line" ]; do
+              [[ -z "$line" ]] && continue
+              if echo "$line" | grep -q '^\s*#'; then
+                  continue
+              fi
+              image=$(echo "$line" | awk '{print $NF}')
+              image="${image%%@*}"
+              image_name_tag=$(echo "$image" | awk -F'/' '{print $NF}')
+              name_space=$(echo "$image" | awk -F'/' '{if (NF==3) print $2; else if (NF==2) print $1; else print ""}')
+              name_space="${name_space}_"
+              image_name=$(echo "$image_name_tag" | awk -F':' '{print $1}')
+              if [[ -n "${temp_map[$image_name]}" ]]; then
+                   if [[ "${temp_map[$image_name]}" != $name_space ]]; then
+                      duplicate_images[$image_name]="true"
+                   fi
+              else
+                  temp_map[$image_name]=$name_space
+              fi
+          done < images.txt
+
+          while IFS= read -r line || [ -n "$line" ]; do
+              [[ -z "$line" ]] && continue
+              if echo "$line" | grep -q '^\s*#'; then
+                  continue
+              fi
+
+              # 获取镜像信息
+              image=$(echo "$line" | awk '{print $NF}')
+              platform=$(echo "$line" | awk -F'--platform[ =]' '{if (NF>1) print $2}' | awk '{print $1}')
+              if [ -z "$platform" ]; then
+                  platform_prefix=""
+              else
+                  platform_prefix="${platform//\//_}_"
+              fi
+              image_name_tag=$(echo "$image" | awk -F'/' '{print $NF}')
+              name_space=$(echo "$image" | awk -F'/' '{if (NF==3) print $2; else if (NF==2) print $1; else print ""}')
+              image_name=$(echo "$image_name_tag" | awk -F':' '{print $1}')
+
+              name_space_prefix=""
+              if [[ -n "${duplicate_images[$image_name]}" ]]; then
+                 if [[ -n "${name_space}" ]]; then
+                    name_space_prefix="${name_space}_"
+                 fi
+              fi
+
+              image_name_tag="${image_name_tag%%@*}"
+              new_image="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$platform_prefix$name_space_prefix$image_name_tag"
+
+              echo "========================================"
+              echo "处理镜像: $image"
+              echo "目标镜像: $new_image"
+
+              # 检查是否需要同步（非强制模式下检查远端摘要）
+              NEED_SYNC="true"
+              if [[ "$FORCE_SYNC" != "true" ]]; then
+                  echo "检查镜像是否有更新..."
+                  # 获取源镜像摘要
+                  SOURCE_DIGEST=$(docker buildx imagetools inspect "$image" 2>/dev/null | grep -m1 "Digest:" | awk '{print $2}' || echo "")
+                  # 获取目标镜像摘要
+                  TARGET_DIGEST=$(docker buildx imagetools inspect "$new_image" 2>/dev/null | grep -m1 "Digest:" | awk '{print $2}' || echo "")
+
+                  if [[ -n "$SOURCE_DIGEST" && -n "$TARGET_DIGEST" && "$SOURCE_DIGEST" == "$TARGET_DIGEST" ]]; then
+                      echo "镜像未更新，跳过同步: $image"
+                      NEED_SYNC="false"
+                      SKIPPED=$((SKIPPED + 1))
+                      SYNC_LOG="${SYNC_LOG}\n⏭️ 跳过(未更新): ${image}"
+                  fi
+              fi
+
+              if [[ "$NEED_SYNC" == "true" ]]; then
+                  echo "开始同步: $image"
+                  if docker pull $line; then
+                      docker tag $image $new_image
+                      if docker push $new_image; then
+                          echo "同步成功: $image -> $new_image"
+                          SYNCED=$((SYNCED + 1))
+                          SYNC_LOG="${SYNC_LOG}\n✅ 同步成功: ${image}"
+                      else
+                          echo "推送失败: $new_image"
+                          FAILED=$((FAILED + 1))
+                          SYNC_LOG="${SYNC_LOG}\n❌ 推送失败: ${image}"
+                      fi
+                  else
+                      echo "拉取失败: $line"
+                      FAILED=$((FAILED + 1))
+                      SYNC_LOG="${SYNC_LOG}\n❌ 拉取失败: ${image}"
+                  fi
+
+                  # 清理磁盘空间
+                  echo "清理磁盘空间"
+                  docker rmi $image 2>/dev/null || true
+                  docker rmi $new_image 2>/dev/null || true
+                  df -hT
+              fi
+
+          done < images.txt
+
+          # 输出结果
+          echo "========================================"
+          echo "同步结果汇总:"
+          echo "  同步成功: $SYNCED"
+          echo "  跳过(未更新): $SKIPPED"
+          echo "  失败: $FAILED"
+          echo "========================================"
+
+          if [[ $FAILED -gt 0 ]]; then
+              echo "result=partial_failure" >> $GITHUB_OUTPUT
+          else
+              echo "result=success" >> $GITHUB_OUTPUT
+          fi
+          echo "synced_count=$SYNCED" >> $GITHUB_OUTPUT
+          echo "skipped_count=$SKIPPED" >> $GITHUB_OUTPUT
+          echo "failed_count=$FAILED" >> $GITHUB_OUTPUT
+
+          # 保存日志到文件
+          echo -e "$SYNC_LOG" > /tmp/sync_log.txt
+
+          # 如果有失败则退出码非零
+          if [[ $FAILED -gt 0 ]]; then
+              exit 1
+          fi
+
+  notify-on-failure:
+    name: Notify on Failure
+    needs: check-and-sync
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Create failure notification issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `🚨 镜像自动同步失败 - ${new Date().toISOString().split('T')[0]}`;
+            const body = `## 镜像自动同步失败通知
+
+            **运行时间**: ${new Date().toISOString()}
+            **触发方式**: ${context.eventName === 'schedule' ? '定时任务' : '手动触发'}
+            **同步结果**: ${{ needs.check-and-sync.outputs.sync_result }}
+
+            ### 统计
+            | 状态 | 数量 |
+            |------|------|
+            | ✅ 同步成功 | ${{ needs.check-and-sync.outputs.synced_count }} |
+            | ⏭️ 跳过 | ${{ needs.check-and-sync.outputs.skipped_count }} |
+            | ❌ 失败 | ${{ needs.check-and-sync.outputs.failed_count }} |
+
+            ### 详情
+            请查看 [Action 运行日志](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) 获取详细信息。
+
+            ---
+            *此 Issue 由自动同步策略自动创建*`;
+
+            // 检查是否已有同名 issue
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'auto-sync-failure'
+            });
+
+            if (issues.data.length > 0) {
+              // 更新已有 issue
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issues.data[0].number,
+                body: body
+              });
+            } else {
+              // 创建新 issue
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: body,
+                labels: ['auto-sync-failure']
+              });
+            }
+
+  notify-on-success:
+    name: Notify on Success
+    needs: check-and-sync
+    if: success()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Close resolved failure issues
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // 如果同步成功，自动关闭之前的失败通知 issue
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'auto-sync-failure'
+            });
+
+            for (const issue of issues.data) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: `✅ 镜像自动同步已恢复正常\n\n**恢复时间**: ${new Date().toISOString()}\n- 同步成功: ${{ needs.check-and-sync.outputs.synced_count }}\n- 跳过(未更新): ${{ needs.check-and-sync.outputs.skipped_count }}\n\n*自动关闭此 Issue*`
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed'
+              });
+            }
